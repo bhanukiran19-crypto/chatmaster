@@ -1,0 +1,438 @@
+// ChatMaster data model.
+//
+// Conventions
+// - Table and column names are snake_case via @@map/@map so the hand-written
+//   RLS policies in the migration are readable.
+// - Every tenant-owned table carries tenant_id (even when it is derivable via a
+//   parent) so RLS can be enforced per row without joins.
+// - Platform-specific data is modelled behind the `Platform` enum; adding a new
+//   platform is a new enum value + a new adapter, not a new set of tables.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = []
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Platform {
+  TELEGRAM
+  INSTAGRAM
+  FACEBOOK
+  WHATSAPP
+}
+
+enum UserStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  LOCKED
+  DISABLED
+}
+
+enum VerificationChannel {
+  EMAIL
+  SMS
+}
+
+enum VerificationPurpose {
+  EMAIL_VERIFY
+  PHONE_VERIFY
+  PASSWORD_RESET
+}
+
+enum ConnectionStatus {
+  PENDING
+  ACTIVE
+  DISABLED
+  ERROR
+}
+
+enum TriggerType {
+  EXACT
+  CONTAINS
+  COMMAND
+  ANY
+  START
+}
+
+enum ParseMode {
+  NONE
+  HTML
+  MARKDOWN_V2
+}
+
+enum MediaType {
+  IMAGE
+  DOCUMENT
+}
+
+enum ButtonType {
+  URL
+  CALLBACK
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+model User {
+  id               String     @id @default(uuid()) @db.Uuid
+  /// Lower-cased at the service layer; must be a gmail.com address at signup.
+  email            String     @unique @db.Citext
+  emailVerifiedAt  DateTime?  @map("email_verified_at") @db.Timestamptz(3)
+  /// E.164, e.g. +919876543210
+  phoneE164        String     @unique @map("phone_e164") @db.VarChar(20)
+  phoneVerifiedAt  DateTime?  @map("phone_verified_at") @db.Timestamptz(3)
+  /// Argon2id PHC string. Never logged, never returned.
+  passwordHash     String     @map("password_hash")
+  status           UserStatus @default(PENDING_VERIFICATION)
+  failedLoginCount Int        @default(0) @map("failed_login_count")
+  lockedUntil      DateTime?  @map("locked_until") @db.Timestamptz(3)
+  createdAt        DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  tenant            Tenant?
+  sessions          Session[]
+  verificationCodes VerificationCode[]
+  auditLogs         AuditLog[]
+
+  @@map("users")
+}
+
+/// One tenant per user for now. Modelled separately so teams/org accounts can
+/// be added later by introducing a membership table.
+model Tenant {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String   @db.VarChar(120)
+  ownerUserId String   @unique @map("owner_user_id") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  owner               User                  @relation(fields: [ownerUserId], references: [id], onDelete: Restrict)
+  platformConnections PlatformConnection[]
+  workflows           Workflow[]
+  workflowTriggers    WorkflowTrigger[]
+  workflowReplies     WorkflowReply[]
+  workflowButtons     WorkflowReplyButton[]
+  activeContacts      ActiveContact[]
+  processedUpdates    ProcessedUpdate[]
+  auditLogs           AuditLog[]
+  subscription        Subscription?
+
+  @@map("tenants")
+}
+
+/// A logged-in device. Refresh tokens rotate within a session; reuse of an
+/// already-used refresh token revokes the whole session (token-family detection).
+model Session {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @map("user_id") @db.Uuid
+  userAgent    String?   @map("user_agent") @db.VarChar(512)
+  ipAddress    String?   @map("ip_address") @db.Inet
+  expiresAt    DateTime  @map("expires_at") @db.Timestamptz(3)
+  revokedAt    DateTime? @map("revoked_at") @db.Timestamptz(3)
+  revokeReason String?   @map("revoke_reason") @db.VarChar(64)
+  lastSeenAt   DateTime  @default(now()) @map("last_seen_at") @db.Timestamptz(3)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokens RefreshToken[]
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+model RefreshToken {
+  id         String    @id @default(uuid()) @db.Uuid
+  sessionId  String    @map("session_id") @db.Uuid
+  /// SHA-256 of the opaque token handed to the client. Raw token is never stored.
+  tokenHash  String    @unique @map("token_hash") @db.Char(64)
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(3)
+  /// Set when rotated. A second presentation of a used token is a replay.
+  usedAt     DateTime? @map("used_at") @db.Timestamptz(3)
+  replacedBy String?   @map("replaced_by") @db.Uuid
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+/// Email verification links, SMS OTPs and password-reset codes.
+model VerificationCode {
+  id          String              @id @default(uuid()) @db.Uuid
+  userId      String              @map("user_id") @db.Uuid
+  channel     VerificationChannel
+  purpose     VerificationPurpose
+  /// Email address or E.164 phone the code was sent to (snapshot at send time).
+  target      String              @db.VarChar(320)
+  /// SHA-256 (email link tokens) or Argon2id (short numeric OTPs) of the code.
+  codeHash    String              @map("code_hash")
+  attempts    Int                 @default(0)
+  maxAttempts Int                 @default(5) @map("max_attempts")
+  expiresAt   DateTime            @map("expires_at") @db.Timestamptz(3)
+  consumedAt  DateTime?           @map("consumed_at") @db.Timestamptz(3)
+  createdAt   DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose, createdAt])
+  @@index([expiresAt])
+  @@map("verification_codes")
+}
+
+// ---------------------------------------------------------------------------
+// Platforms
+// ---------------------------------------------------------------------------
+
+/// A connected account on a messaging platform (for Telegram: one bot).
+model PlatformConnection {
+  id                String           @id @default(uuid()) @db.Uuid
+  tenantId          String           @map("tenant_id") @db.Uuid
+  platform          Platform
+  status            ConnectionStatus @default(PENDING)
+  /// Platform-side identifier (Telegram: bot id from getMe).
+  externalAccountId String           @map("external_account_id") @db.VarChar(128)
+  /// Human-readable label (Telegram: @bot_username).
+  displayName       String           @map("display_name") @db.VarChar(128)
+  /// AES-256-GCM ciphertext produced by EncryptionService (iv|tag|ciphertext).
+  encryptedToken    Bytes            @map("encrypted_token")
+  /// Which data-encryption key encrypted `encryptedToken`; enables rotation.
+  tokenKeyVersion   Int              @map("token_key_version")
+  /// Random, unguessable path segment: POST /webhooks/telegram/{webhookPathId}
+  webhookPathId     String           @unique @map("webhook_path_id") @db.VarChar(128)
+  /// SHA-256 of the random secret sent to setWebhook(secret_token) and echoed
+  /// back by Telegram in X-Telegram-Bot-Api-Secret-Token.
+  secretTokenHash   String           @map("secret_token_hash") @db.Char(64)
+  lastWebhookAt     DateTime?        @map("last_webhook_at") @db.Timestamptz(3)
+  lastError         String?          @map("last_error") @db.VarChar(1024)
+  createdAt         DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  tenant           Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  workflows        Workflow[]
+  processedUpdates ProcessedUpdate[]
+
+  @@unique([tenantId, platform, externalAccountId])
+  @@index([tenantId, platform])
+  @@map("platform_connections")
+}
+
+// ---------------------------------------------------------------------------
+// Workflows
+// ---------------------------------------------------------------------------
+
+model Workflow {
+  id                   String   @id @default(uuid()) @db.Uuid
+  tenantId             String   @map("tenant_id") @db.Uuid
+  platformConnectionId String   @map("platform_connection_id") @db.Uuid
+  name                 String   @db.VarChar(120)
+  enabled              Boolean  @default(true)
+  /// Lower number = evaluated first. First match wins.
+  priority             Int      @default(100)
+  /// Minimum seconds between two replies from this workflow to the same chat.
+  cooldownSeconds      Int      @default(0) @map("cooldown_seconds")
+  createdAt            DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  tenant             Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  platformConnection PlatformConnection @relation(fields: [platformConnectionId], references: [id], onDelete: Cascade)
+  triggers           WorkflowTrigger[]
+  replies            WorkflowReply[]
+
+  @@index([tenantId])
+  @@index([platformConnectionId, enabled, priority])
+  /// Keyset pagination order for GET /workflows.
+  @@index([tenantId, priority, id])
+  @@map("workflows")
+}
+
+model WorkflowTrigger {
+  id              String      @id @default(uuid()) @db.Uuid
+  tenantId        String      @map("tenant_id") @db.Uuid
+  workflowId      String      @map("workflow_id") @db.Uuid
+  type            TriggerType
+  /// Keyword / exact text / command name. NULL for ANY and START.
+  value           String?     @db.VarChar(512)
+  caseInsensitive Boolean     @default(true) @map("case_insensitive")
+  position        Int         @default(0)
+  createdAt       DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  workflow Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([workflowId, position])
+  @@map("workflow_triggers")
+}
+
+model WorkflowReply {
+  id             String     @id @default(uuid()) @db.Uuid
+  tenantId       String     @map("tenant_id") @db.Uuid
+  workflowId     String     @map("workflow_id") @db.Uuid
+  /// 0 = primary reply sent on trigger match; >0 = replies reachable via callback buttons.
+  position       Int        @default(0)
+  text           String     @db.VarChar(4096)
+  parseMode      ParseMode  @default(NONE) @map("parse_mode")
+  mediaType      MediaType? @map("media_type")
+  /// Object-storage key of validated upload. NULL when no media.
+  mediaObjectKey String?    @map("media_object_key") @db.VarChar(512)
+  mediaMimeType  String?    @map("media_mime_type") @db.VarChar(128)
+  mediaSizeBytes Int?       @map("media_size_bytes")
+  createdAt      DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  tenant   Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  workflow Workflow              @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  buttons  WorkflowReplyButton[]
+  linkedBy WorkflowReplyButton[] @relation("ButtonNextReply")
+
+  @@index([tenantId])
+  @@index([workflowId, position])
+  @@map("workflow_replies")
+}
+
+/// Inline keyboard button. URL buttons open a link; CALLBACK buttons chain to
+/// `nextReply` within the same workflow.
+model WorkflowReplyButton {
+  id          String     @id @default(uuid()) @db.Uuid
+  tenantId    String     @map("tenant_id") @db.Uuid
+  replyId     String     @map("reply_id") @db.Uuid
+  row         Int        @default(0)
+  column      Int        @default(0)
+  type        ButtonType
+  label       String     @db.VarChar(64)
+  url         String?    @db.VarChar(2048)
+  nextReplyId String?    @map("next_reply_id") @db.Uuid
+  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  tenant    Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reply     WorkflowReply  @relation(fields: [replyId], references: [id], onDelete: Cascade)
+  nextReply WorkflowReply? @relation("ButtonNextReply", fields: [nextReplyId], references: [id], onDelete: SetNull)
+
+  @@unique([replyId, row, column])
+  @@index([tenantId])
+  @@index([nextReplyId])
+  @@map("workflow_reply_buttons")
+}
+
+// ---------------------------------------------------------------------------
+// Billing metric, idempotency, audit
+// ---------------------------------------------------------------------------
+
+/// Billing metric: a unique chat we replied to, per platform, per calendar month.
+model ActiveContact {
+  id             String   @id @default(uuid()) @db.Uuid
+  tenantId       String   @map("tenant_id") @db.Uuid
+  platform       Platform
+  externalChatId String   @map("external_chat_id") @db.VarChar(128)
+  /// First day of the calendar month (UTC), e.g. 2025-01-01.
+  month          DateTime @db.Date
+  firstRepliedAt DateTime @default(now()) @map("first_replied_at") @db.Timestamptz(3)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, platform, externalChatId, month])
+  @@index([tenantId, month])
+  @@map("active_contacts")
+}
+
+/// Idempotency record for inbound webhook updates (Telegram update_id is a
+/// 64-bit integer unique per bot). Rows are purged after a retention window.
+model ProcessedUpdate {
+  id                   String   @id @default(uuid()) @db.Uuid
+  tenantId             String   @map("tenant_id") @db.Uuid
+  platformConnectionId String   @map("platform_connection_id") @db.Uuid
+  updateId             BigInt   @map("update_id")
+  processedAt          DateTime @default(now()) @map("processed_at") @db.Timestamptz(3)
+
+  tenant             Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  platformConnection PlatformConnection @relation(fields: [platformConnectionId], references: [id], onDelete: Cascade)
+
+  @@unique([platformConnectionId, updateId])
+  @@index([tenantId])
+  @@index([processedAt])
+  @@map("processed_updates")
+}
+
+model AuditLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  /// NULL for pre-tenant events (signup, login failures).
+  tenantId    String?  @map("tenant_id") @db.Uuid
+  actorUserId String?  @map("actor_user_id") @db.Uuid
+  action      String   @db.VarChar(64)
+  entityType  String?  @map("entity_type") @db.VarChar(64)
+  entityId    String?  @map("entity_id") @db.VarChar(128)
+  /// Redacted metadata only. Never tokens, OTPs or passwords.
+  metadata    Json?
+  ipAddress   String?  @map("ip_address") @db.Inet
+  userAgent   String?  @map("user_agent") @db.VarChar(512)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+  actor  User?   @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, createdAt])
+  @@index([actorUserId, createdAt])
+  @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Billing
+// ---------------------------------------------------------------------------
+
+model Plan {
+  id                 String   @id @default(uuid()) @db.Uuid
+  code               String   @unique @db.VarChar(32)
+  name               String   @db.VarChar(64)
+  priceCents         Int      @map("price_cents")
+  currency           String   @default("USD") @db.Char(3)
+  /// Max unique active contacts per calendar month across all platforms.
+  activeContactLimit Int      @map("active_contact_limit")
+  isDefault          Boolean  @default(false) @map("is_default")
+  isActive           Boolean  @default(true) @map("is_active")
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  subscriptions Subscription[]
+
+  @@map("plans")
+}
+
+model Subscription {
+  id                 String             @id @default(uuid()) @db.Uuid
+  tenantId           String             @unique @map("tenant_id") @db.Uuid
+  planId             String             @map("plan_id") @db.Uuid
+  status             SubscriptionStatus @default(TRIALING)
+  currentPeriodStart DateTime           @map("current_period_start") @db.Timestamptz(3)
+  currentPeriodEnd   DateTime           @map("current_period_end") @db.Timestamptz(3)
+  cancelAtPeriodEnd  Boolean            @default(false) @map("cancel_at_period_end")
+  /// Payment-provider customer/subscription reference, when billing is wired up.
+  externalRef        String?            @map("external_ref") @db.VarChar(128)
+  createdAt          DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  plan   Plan   @relation(fields: [planId], references: [id], onDelete: Restrict)
+
+  @@index([planId])
+  @@index([status, currentPeriodEnd])
+  @@map("subscriptions")
+}

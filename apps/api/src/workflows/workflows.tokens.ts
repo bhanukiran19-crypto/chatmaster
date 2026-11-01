@@ -1,0 +1,1 @@
+export const WORKFLOW_SERVICE = Symbol('WORKFLOW_SERVICE');
