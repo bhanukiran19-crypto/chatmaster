@@ -27,7 +27,7 @@
     "rls:smoke": "bash scripts/rls-smoke.sh"
   },
   "dependencies": {
-    "@prisma/client": "^6.1.0"
+    "@prisma/client": "^7.10.1"
   },
   "devDependencies": {
     "prisma": "^6.1.0",
