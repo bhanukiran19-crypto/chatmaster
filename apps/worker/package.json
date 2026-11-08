@@ -15,7 +15,7 @@
     "@chatmaster/crypto": "workspace:*",
     "@chatmaster/db": "workspace:*",
     "@chatmaster/shared": "workspace:*",
-    "bullmq": "^6.5.3",
+    "bullmq": "^6.7.0",
     "ioredis": "^6.0.0",
     "pino": "^10.4.0",
     "zod": "^4.6.7"

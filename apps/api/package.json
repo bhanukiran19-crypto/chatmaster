@@ -21,7 +21,7 @@
     "@upstash/ratelimit": "^2.2.0",
     "@upstash/redis": "^1.40.0",
     "argon2": "^0.45.1",
-    "bullmq": "^6.5.3",
+    "bullmq": "^6.7.0",
     "cookie-parser": "^1.4.7",
     "express": "^5.3.0",
     "helmet": "^8.1.0",
